@@ -424,40 +424,21 @@ mod tests {
         };
 
         let update_result = provider.update(update_request).await;
+
+        // Every local_file attribute forces replacement, so changing `content` is a
+        // destroy+create rather than an in-place update. Now that we run the Terraform
+        // plan phase, the provider reports `requires_replace` and we surface a clear
+        // error instead of silently no-op'ing (the old, plan-skipping behavior).
+        let err = update_result.expect_err("updating a force-replacement resource should error");
+        let msg = format!("{:#}", err);
         assert!(
-            update_result.is_ok(),
-            "TerraformProvider.update should succeed: {:?}",
-            update_result
+            msg.contains("requires replacing"),
+            "error should explain that the change forces replacement, got: {msg}"
         );
 
-        let update_response = update_result.unwrap();
-
-        // Verify response structure
-        assert!(
-            !update_response.output_properties.0.is_empty(),
-            "Should have output properties"
-        );
-        assert_eq!(
-            update_response.output_properties.0.get("content"),
-            Some(&Value::String(
-                "Updated content via TerraformProvider!".to_string()
-            )),
-            "Output should reflect updated content"
-        );
-
-        // NOTE: terraform provider local_file does not actually support updates
-        // The Update method is a no-op that just returns the planned state without
-        // performing any file operations. This is confirmed by examining the source:
-        // https://github.com/hashicorp/terraform-provider-local
-        //
-        // TODO: Consider using https://github.com/rancher/terraform-provider-file/blob/main/internal/provider/file_local_resource.go
-        // which may have proper update support
-        //
-        // We assert the current behavior (no actual update) since the assertion with expected
-        // update behavior was failing. This documents the terraform provider limitation.
+        // The file on disk is untouched by the failed update.
         let updated_content = std::fs::read_to_string(&temp_path).expect("File should still exist");
-        assert_eq!(updated_content, "Initial content for update test",
-                   "terraform provider local_file doesn't actually update files - this documents current behavior");
+        assert_eq!(updated_content, "Initial content for update test");
 
         // Keep temp_file alive until the end
         drop(temp_file);

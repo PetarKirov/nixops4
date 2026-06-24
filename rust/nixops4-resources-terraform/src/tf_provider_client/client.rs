@@ -207,7 +207,12 @@ impl ClientConnection {
             .as_ref()
             .context("Resource schema missing block definition")?;
 
-        // Create complete planned state with null values for missing optional attributes
+        // Keep the user-supplied inputs (before null-completion) so we can build a
+        // Terraform-faithful proposed new state for the plan request.
+        let user_inputs = planned_state.clone();
+
+        // Create complete planned state with null values for missing optional attributes.
+        // This is the resource *config* (unset optionals/computed are null).
         let complete_planned_state = Self::complete_resource_state(planned_state, resource_block)?;
 
         // Also complete the prior state if it exists
@@ -218,6 +223,16 @@ impl ClientConnection {
             )?),
             None => None,
         };
+
+        // Terraform's "proposed new state" feeds the plan: configured values win,
+        // computed attributes the user left unset keep their prior value (so the
+        // provider doesn't treat them as "known after apply"), and other unset
+        // attributes become null. For creation this is just the config.
+        let proposed_new_state = Self::build_proposed_new_state(
+            &user_inputs,
+            complete_prior_state.as_ref(),
+            resource_block,
+        )?;
 
         if is_data_source {
             // Use ReadDataSource for data sources
@@ -305,17 +320,66 @@ impl ClientConnection {
                         Some(s) => Self::json_map_to_dynamic_value_v5(s.clone())?,
                         None => Self::null_dynamic_value_v5()?, // Null state for creation
                     };
-                    let config_dv =
-                        Self::json_map_to_dynamic_value_v5(complete_planned_state.clone())?;
-                    let planned_state_dv =
-                        Self::json_map_to_dynamic_value_v5(complete_planned_state)?;
+                    let config_dv = Self::json_map_to_dynamic_value_v5(complete_planned_state)?;
+                    let proposed_state_dv = Self::json_map_to_dynamic_value_v5(proposed_new_state)?;
+
+                    // Plan phase: let the provider compute defaults, normalization and
+                    // "known after apply" markers before we apply. Skipping this is wrong
+                    // for most real resources.
+                    let plan_request = tonic::Request::new(
+                        super::grpc::tfplugin5_9::plan_resource_change::Request {
+                            type_name: terraform_type_name.to_string(),
+                            prior_state: Some(prior_state_dv.clone()),
+                            proposed_new_state: Some(proposed_state_dv),
+                            config: Some(config_dv.clone()),
+                            prior_private: vec![],
+                            provider_meta: None,
+                            client_capabilities: None,
+                            prior_identity: None,
+                        },
+                    );
+                    let plan_response = client
+                        .plan_resource_change(plan_request)
+                        .await
+                        .context("Failed to call PlanResourceChange (v5)")?
+                        .into_inner();
+                    for diagnostic in &plan_response.diagnostics {
+                        if diagnostic.severity
+                            == super::grpc::tfplugin5_9::diagnostic::Severity::Error as i32
+                        {
+                            bail!(
+                                "Terraform provider error during plan: {} - {}",
+                                diagnostic.summary,
+                                diagnostic.detail
+                            );
+                        }
+                    }
+                    // A change that forces replacement is a destroy+create, which this
+                    // integration does not drive yet. Feeding the "known after apply"
+                    // planned state into an in-place update would yield unknown values in
+                    // the result, so fail with a clear message instead.
+                    if complete_prior_state.is_some() && !plan_response.requires_replace.is_empty()
+                    {
+                        bail!(
+                            "Updating Terraform resource '{}' requires replacing it \
+                             ({} attribute(s) force replacement), which is not supported yet. \
+                             Destroy and re-create the resource instead.",
+                            terraform_type_name,
+                            plan_response.requires_replace.len()
+                        );
+                    }
+                    let planned_state_dv = plan_response
+                        .planned_state
+                        .context("PlanResourceChange returned no planned state (v5)")?;
+                    let planned_private = plan_response.planned_private;
+
                     let request = tonic::Request::new(
                         super::grpc::tfplugin5_9::apply_resource_change::Request {
                             type_name: terraform_type_name.to_string(),
                             prior_state: Some(prior_state_dv),
                             planned_state: Some(planned_state_dv),
                             config: Some(config_dv), // Config contains the input configuration
-                            planned_private: vec![], // TODO: handle private state
+                            planned_private,         // Carry the plan's private blob into apply
                             provider_meta: None,     // Not needed for basic operation
                             planned_identity: None,  // Not needed for basic operation
                         },
@@ -354,19 +418,68 @@ impl ClientConnection {
                         Some(s) => Self::json_map_to_dynamic_value_v6(s.clone())?,
                         None => Self::null_dynamic_value_v6()?, // Null state for creation
                     };
-                    let config_dv =
-                        Self::json_map_to_dynamic_value_v6(complete_planned_state.clone())?;
-                    let planned_state_dv =
-                        Self::json_map_to_dynamic_value_v6(complete_planned_state)?;
+                    let config_dv = Self::json_map_to_dynamic_value_v6(complete_planned_state)?;
+                    let proposed_state_dv = Self::json_map_to_dynamic_value_v6(proposed_new_state)?;
+
+                    // Plan phase: let the provider compute defaults, normalization and
+                    // "known after apply" markers before we apply. Skipping this is wrong
+                    // for most real resources.
+                    let plan_request = tonic::Request::new(
+                        super::grpc::tfplugin6_9::plan_resource_change::Request {
+                            type_name: terraform_type_name.to_string(),
+                            prior_state: Some(prior_state_dv.clone()),
+                            proposed_new_state: Some(proposed_state_dv),
+                            config: Some(config_dv.clone()),
+                            prior_private: vec![],
+                            provider_meta: None,
+                            client_capabilities: None,
+                            prior_identity: None,
+                        },
+                    );
+                    let plan_response = client
+                        .plan_resource_change(plan_request)
+                        .await
+                        .context("Failed to call PlanResourceChange (v6)")?
+                        .into_inner();
+                    for diagnostic in &plan_response.diagnostics {
+                        if diagnostic.severity
+                            == super::grpc::tfplugin6_9::diagnostic::Severity::Error as i32
+                        {
+                            bail!(
+                                "Terraform provider error during plan: {} - {}",
+                                diagnostic.summary,
+                                diagnostic.detail
+                            );
+                        }
+                    }
+                    // A change that forces replacement is a destroy+create, which this
+                    // integration does not drive yet. Feeding the "known after apply"
+                    // planned state into an in-place update would yield unknown values in
+                    // the result, so fail with a clear message instead.
+                    if complete_prior_state.is_some() && !plan_response.requires_replace.is_empty()
+                    {
+                        bail!(
+                            "Updating Terraform resource '{}' requires replacing it \
+                             ({} attribute(s) force replacement), which is not supported yet. \
+                             Destroy and re-create the resource instead.",
+                            terraform_type_name,
+                            plan_response.requires_replace.len()
+                        );
+                    }
+                    let planned_state_dv = plan_response
+                        .planned_state
+                        .context("PlanResourceChange returned no planned state (v6)")?;
+                    let planned_private = plan_response.planned_private;
+
                     let request = tonic::Request::new(
                         super::grpc::tfplugin6_9::apply_resource_change::Request {
                             type_name: terraform_type_name.to_string(),
                             prior_state: Some(prior_state_dv),
                             planned_state: Some(planned_state_dv),
                             config: Some(config_dv), // Config contains the input configuration
-                            planned_private: vec![],
-                            provider_meta: None, // Not needed for basic operation
-                            planned_identity: None, // Not needed for basic operation
+                            planned_private,         // Carry the plan's private blob into apply
+                            provider_meta: None,     // Not needed for basic operation
+                            planned_identity: None,  // Not needed for basic operation
                         },
                     );
                     let response = client
@@ -425,15 +538,47 @@ impl ClientConnection {
         match self {
             ClientConnection::V5(client) => {
                 let prior_state_dv = Self::json_map_to_dynamic_value_v5(complete_prior_state)?;
-                let planned_state_dv = Self::null_dynamic_value_v5()?;
-                let config_dv = Self::null_dynamic_value_v5()?;
+                let null_dv = Self::null_dynamic_value_v5()?;
+
+                // Plan the destroy: a null proposed_new_state signals removal. The provider
+                // returns the planned (null) state plus the private blob to feed into apply.
+                let plan_request =
+                    tonic::Request::new(super::grpc::tfplugin5_9::plan_resource_change::Request {
+                        type_name: resource_type.to_string(),
+                        prior_state: Some(prior_state_dv.clone()),
+                        proposed_new_state: Some(null_dv.clone()),
+                        config: Some(null_dv.clone()),
+                        prior_private: vec![],
+                        provider_meta: None,
+                        client_capabilities: None,
+                        prior_identity: None,
+                    });
+                let plan_response = client
+                    .plan_resource_change(plan_request)
+                    .await
+                    .context("Failed to call PlanResourceChange for destroy (v5)")?
+                    .into_inner();
+                for diagnostic in &plan_response.diagnostics {
+                    if diagnostic.severity
+                        == super::grpc::tfplugin5_9::diagnostic::Severity::Error as i32
+                    {
+                        bail!(
+                            "Terraform provider error during destroy plan: {} - {}",
+                            diagnostic.summary,
+                            diagnostic.detail
+                        );
+                    }
+                }
+                let planned_state_dv = plan_response.planned_state.unwrap_or(null_dv.clone());
+                let planned_private = plan_response.planned_private;
+
                 let request =
                     tonic::Request::new(super::grpc::tfplugin5_9::apply_resource_change::Request {
                         type_name: resource_type.to_string(),
                         prior_state: Some(prior_state_dv),
                         planned_state: Some(planned_state_dv),
-                        config: Some(config_dv),
-                        planned_private: vec![],
+                        config: Some(null_dv),
+                        planned_private,
                         provider_meta: None,
                         planned_identity: None,
                     });
@@ -458,15 +603,47 @@ impl ClientConnection {
             }
             ClientConnection::V6(client) => {
                 let prior_state_dv = Self::json_map_to_dynamic_value_v6(complete_prior_state)?;
-                let planned_state_dv = Self::null_dynamic_value_v6()?;
-                let config_dv = Self::null_dynamic_value_v6()?;
+                let null_dv = Self::null_dynamic_value_v6()?;
+
+                // Plan the destroy: a null proposed_new_state signals removal. The provider
+                // returns the planned (null) state plus the private blob to feed into apply.
+                let plan_request =
+                    tonic::Request::new(super::grpc::tfplugin6_9::plan_resource_change::Request {
+                        type_name: resource_type.to_string(),
+                        prior_state: Some(prior_state_dv.clone()),
+                        proposed_new_state: Some(null_dv.clone()),
+                        config: Some(null_dv.clone()),
+                        prior_private: vec![],
+                        provider_meta: None,
+                        client_capabilities: None,
+                        prior_identity: None,
+                    });
+                let plan_response = client
+                    .plan_resource_change(plan_request)
+                    .await
+                    .context("Failed to call PlanResourceChange for destroy (v6)")?
+                    .into_inner();
+                for diagnostic in &plan_response.diagnostics {
+                    if diagnostic.severity
+                        == super::grpc::tfplugin6_9::diagnostic::Severity::Error as i32
+                    {
+                        bail!(
+                            "Terraform provider error during destroy plan: {} - {}",
+                            diagnostic.summary,
+                            diagnostic.detail
+                        );
+                    }
+                }
+                let planned_state_dv = plan_response.planned_state.unwrap_or(null_dv.clone());
+                let planned_private = plan_response.planned_private;
+
                 let request =
                     tonic::Request::new(super::grpc::tfplugin6_9::apply_resource_change::Request {
                         type_name: resource_type.to_string(),
                         prior_state: Some(prior_state_dv),
                         planned_state: Some(planned_state_dv),
-                        config: Some(config_dv),
-                        planned_private: vec![],
+                        config: Some(null_dv),
+                        planned_private,
                         provider_meta: None,
                         planned_identity: None,
                     });
@@ -596,6 +773,48 @@ impl ClientConnection {
             serde_json::Value::Null => Ok(None),
             _ => Self::dynamic_value_v6_to_json_map(dynamic_value).map(Some),
         }
+    }
+
+    /// Build Terraform's "proposed new state" for a `PlanResourceChange` request.
+    ///
+    /// This mirrors Terraform Core's object-merge (`objchange.ProposedNew`) for the
+    /// flat-attribute case: for creation (no prior state) the proposal is just the
+    /// user configuration; for an update, configured (non-null) values win, computed
+    /// attributes the user left unset keep their prior value (so the provider does not
+    /// re-mark them "known after apply"), and other unset attributes become null.
+    /// Nested blocks carry the configured value, falling back to the prior value.
+    fn build_proposed_new_state(
+        user_inputs: &std::collections::HashMap<String, serde_json::Value>,
+        prior_state: Option<&std::collections::HashMap<String, serde_json::Value>>,
+        resource_block: &crate::schema::Block,
+    ) -> Result<std::collections::HashMap<String, serde_json::Value>> {
+        let prior = match prior_state {
+            // Creation: the proposed state is simply the (completed) configuration.
+            None => return Self::complete_resource_state(user_inputs.clone(), resource_block),
+            Some(prior) => prior,
+        };
+
+        let mut proposed = std::collections::HashMap::new();
+        for (name, attr) in &resource_block.attributes {
+            let configured = user_inputs.get(name).filter(|v| !v.is_null());
+            let value = match configured {
+                Some(v) => v.clone(),
+                None if attr.computed => {
+                    prior.get(name).cloned().unwrap_or(serde_json::Value::Null)
+                }
+                None => serde_json::Value::Null,
+            };
+            proposed.insert(name.clone(), value);
+        }
+        for name in resource_block.block_types.keys() {
+            if let Some(v) = user_inputs.get(name) {
+                proposed.insert(name.clone(), v.clone());
+            } else if let Some(v) = prior.get(name) {
+                proposed.insert(name.clone(), v.clone());
+            }
+        }
+
+        Self::complete_resource_state(proposed, resource_block)
     }
 
     /// Complete resource state by adding null values for missing optional attributes
@@ -1379,43 +1598,23 @@ mod tests {
             )
             .await;
 
+        // Every local_file attribute forces replacement, so changing `content` is a
+        // destroy+create rather than an in-place update. Now that we run the Terraform
+        // plan phase, the provider reports `requires_replace`, and we surface a clear
+        // error instead of silently no-op'ing (the old, plan-skipping behavior) or
+        // panicking on the "known after apply" values in the planned state.
+        let err = update_result
+            .expect_err("updating a force-replacement resource via the update path should error");
+        let msg = format!("{:#}", err);
         assert!(
-            update_result.is_ok(),
-            "ApplyResourceChange (update) should succeed: {:?}",
-            update_result
+            msg.contains("requires replacing"),
+            "error should explain that the change forces replacement, got: {msg}"
         );
 
-        let new_state = update_result.unwrap();
-
-        // Verify the response
-        assert!(
-            new_state.contains_key("filename"),
-            "Response should contain filename"
-        );
-        assert!(
-            new_state.contains_key("content"),
-            "Response should contain content"
-        );
-        // The provider claims the update succeeded and returns the planned state
-        assert_eq!(
-            new_state.get("content"),
-            Some(&serde_json::Value::String(
-                "Updated content from NixOps4!".to_string()
-            ))
-        );
-
-        // NOTE: terraform provider local_file does not actually support updates
-        // The Update method is a no-op that just returns the planned state without
-        // performing any file operations. This is confirmed by examining the source.
-        //
-        // TODO: Consider using https://github.com/rancher/terraform-provider-file/blob/main/internal/provider/file_local_resource.go
-        // which may have proper update support
-        //
-        // We assert the current behavior (no actual update) to document this limitation
+        // The file on disk is untouched by the failed update.
         let actual_file_content =
             std::fs::read_to_string(&test_file_path).expect("File should still exist on disk");
-        assert_eq!(actual_file_content, "Initial content",
-                   "terraform provider local_file doesn't actually update files - this documents current behavior");
+        assert_eq!(actual_file_content, "Initial content");
 
         // temp_dir will be automatically cleaned up when it goes out of scope
 
